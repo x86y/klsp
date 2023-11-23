@@ -94,11 +94,62 @@ impl LanguageServer for KLanguageServer {
                     TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)
                 ),
                 definition_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
                 // hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // completion_provider: Some(CompletionOptions::default()),
                 ..ServerCapabilities::default()
             },
         })
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let document_uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        if let Some(doc_text) = self.documents.get(&document_uri) {
+            let definitions = parse(&doc_text, &document_uri);
+            let line_text = doc_text.lines().nth(position.line as usize).unwrap_or("");
+            let variable_name = extract_variable_at_position(line_text, position.character);
+
+            let mut changes = HashMap::new();
+
+            if definitions.contains_key(variable_name) {
+                let mut edits = Vec::new();
+                for (line_index, line) in doc_text.lines().enumerate() {
+                    let mut start_char_index = 0;
+                    while let Some(found_pos) = line[start_char_index..].find(variable_name) {
+                        let start = start_char_index + found_pos;
+                        let end = start + variable_name.len();
+                        if (start == 0 || !line.chars().nth(start - 1).unwrap().is_alphanumeric())
+                            && (end == line.len()
+                                || !line.chars().nth(end).unwrap().is_alphanumeric())
+                        {
+                            let range = Range {
+                                start: Position::new(line_index as u32, start as u32),
+                                end: Position::new(line_index as u32, end as u32),
+                            };
+                            edits.push(TextEdit {
+                                range,
+                                new_text: new_name.clone(),
+                            });
+                        }
+                        start_char_index = end;
+                    }
+                }
+                if !edits.is_empty() {
+                    changes.insert(document_uri, edits);
+                }
+            }
+
+            Ok(Some(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            }))
+        } else {
+            Err(tower_lsp::jsonrpc::Error::new(tower_lsp::jsonrpc::ErrorCode::ParseError))
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
