@@ -40,24 +40,29 @@ fn parse(text: &str, document_uri: &Url) -> HashMap<String, Location> {
 
 fn extract_variable_at_position(line: &str, char_position: u32) -> &str {
     let is_variable_char = |c: char| c.is_alphanumeric() || c == '_';
-    let start = line[..char_position as usize]
-        .chars()
+    let char_pos = char_position as usize;
+    let start = line[..char_pos]
+        .char_indices()
         .rev()
-        .take_while(|&c| is_variable_char(c))
-        .count();
-    let start_index = char_position as usize - start;
-    let end = line[char_position as usize..]
-        .chars()
-        .take_while(|&c| is_variable_char(c))
-        .count();
-    let end_index = char_position as usize + end;
-    &line[start_index..end_index]
+        .find(|&(_, c)| !is_variable_char(c))
+        .map_or(0, |(idx, _)| idx + 1);
+
+    let end = line[char_pos..]
+        .char_indices()
+        .find(|&(_, c)| !is_variable_char(c))
+        .map_or(line.len(), |(idx, _)| char_pos + idx);
+
+    if start <= line.len() && end <= line.len() && start <= end {
+        &line[start..end]
+    } else {
+        ""
+    }
 }
 
 struct KLanguageServer {
     client: Client,
     documents: DashMap<Url, String>,
-    // Other state as needed
+    definitions: DashMap<Url, HashMap<String, Location>>,
 }
 
 impl KLanguageServer {
@@ -159,7 +164,9 @@ impl LanguageServer for KLanguageServer {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
-        self.documents.insert(uri.clone(), text);
+        self.documents.insert(uri.clone(), text.clone());
+        let definitions = parse(&text, &uri);
+        self.definitions.insert(uri.clone(), definitions);
         self.diagnostics(uri).await;
     }
 
@@ -168,7 +175,11 @@ impl LanguageServer for KLanguageServer {
         let text = &params.content_changes[0].text;
         self.documents
             .insert(uri.clone(), text.lines().map(str::to_owned).collect());
-        self.diagnostics(uri).await;
+        self.diagnostics(uri.clone()).await;
+
+        self.definitions.clear();
+        let definitions = parse(text, &uri);
+        self.definitions.insert(uri.clone(), definitions);
     }
 
     async fn goto_definition(
@@ -176,22 +187,25 @@ impl LanguageServer for KLanguageServer {
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         let document_uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
         if let Some(doc_text) = self.documents.get(&document_uri) {
-            let definitions = parse(&doc_text, &document_uri);
-            let position = params.text_document_position_params.position;
-            let line_text = doc_text.lines().nth(position.line as usize).unwrap_or("");
-            let variable_name = extract_variable_at_position(line_text, position.character);
-            let response =
-                if let Some(location) = definitions.get(variable_name) {
-                    let mut updated_location = location.clone();
-                    updated_location.uri = document_uri;
+            if let Some(definitions) = self.definitions.get(&document_uri) {
+                let line_text = doc_text.lines().nth(position.line as usize).unwrap_or("");
+                let variable_name = extract_variable_at_position(line_text, position.character);
 
-                    Some(GotoDefinitionResponse::Scalar(updated_location))
-                } else {
-                    None
-                };
+                let response =
+                    definitions.get(variable_name).map(|location| {
+                        GotoDefinitionResponse::Scalar(Location {
+                            uri: document_uri.clone(),
+                            range: location.range,
+                        })
+                    });
 
-            Ok(response)
+                Ok(response)
+            } else {
+                Err(tower_lsp::jsonrpc::Error::new(tower_lsp::jsonrpc::ErrorCode::InternalError))
+            }
         } else {
             Err(tower_lsp::jsonrpc::Error::new(tower_lsp::jsonrpc::ErrorCode::ParseError))
         }
@@ -259,6 +273,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| KLanguageServer {
         client,
         documents: DashMap::new(),
+        definitions: DashMap::new(),
     });
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
         .serve(service)

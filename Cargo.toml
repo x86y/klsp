@@ -3,6 +3,10 @@ name = "klsp"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name="klsp"
+path = "s/m.rs"
+
 [dependencies]
 tokio = { version = "1.34.0", features = ["full"] }
 regex = "1.10.2"
